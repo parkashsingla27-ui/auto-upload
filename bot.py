@@ -208,6 +208,23 @@ def upload_to_youtube(topic, desc, user_id):
 
 
 def main():
+    # Start a simple health check server for Railway/Render
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is running!")
+        def log_message(self, *args):
+            pass  # suppress logs
+
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"Health check on port {port}")
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))

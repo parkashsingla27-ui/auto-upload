@@ -1,0 +1,6 @@
+python-telegram-bot>=20.0
+moviepy
+gTTS
+langdetect
+google-api-python-client
+google-auth-oauthlib

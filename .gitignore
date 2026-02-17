@@ -1,0 +1,11 @@
+.env
+user_tokens.json
+client_secret.json
+.venv/
+__pycache__/
+output.mp4
+voice.mp3
+backgrounds/
+build/
+dist/
+*.spec

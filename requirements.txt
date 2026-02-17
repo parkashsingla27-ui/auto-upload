@@ -1,5 +1,5 @@
-python-telegram-bot>=20.0
-moviepy
+python-telegram-bot[job-queue]>=20.0
+moviepy==1.0.3
 gTTS
 langdetect
 google-api-python-client

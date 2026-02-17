@@ -2,7 +2,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import os, moviepy as mp, json, warnings
+import os, moviepy as mp, json, warnings, datetime
 warnings.filterwarnings("ignore", message=".*FFMPEG_AudioReader.*")
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -19,9 +19,8 @@ from langdetect import detect
 
 from moviepy import AudioFileClip, ImageClip, CompositeVideoClip
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -29,7 +28,7 @@ from googleapiclient.http import MediaFileUpload
 
 STATE = {}
 os.makedirs("backgrounds", exist_ok=True)
-
+os.makedirs("videos", exist_ok=True)
 
 
 def load_user_tokens():
@@ -46,7 +45,80 @@ def save_user_token(user_id, token):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE[update.effective_chat.id] = {"images": []}
-    await update.message.reply_text("📌 Send topic")
+    await update.message.reply_text(
+        "👋 Welcome! I can create videos from text and images, and upload them to YouTube.\n\n"
+        "Use /menu to see options or just send a topic to start."
+    )
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🎬 Create Video", callback_data="start_flow")],
+        [InlineKeyboardButton("🔑 Set Token", callback_data="set_token_info")],
+        [InlineKeyboardButton("📜 Show All Commands", callback_data="show_commands")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("📋 **Main Menu**:", reply_markup=reply_markup, parse_mode="Markdown")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = update.effective_chat.id
+    
+    if query.data == "start_flow":
+        STATE[chat_id] = {"images": []}
+        await query.message.reply_text("📌 Send topic")
+        
+    elif query.data == "set_token_info":
+        await query.message.reply_text("To set your YouTube refresh token, use:\n`/set token <your_token>`", parse_mode="Markdown")
+        
+    elif query.data == "show_commands":
+        help_text = (
+            "**🤖 Available Commands:**\n\n"
+            "/start - Start the bot\n"
+            "/menu - Show main menu\n"
+            "/set - Set configurations (e.g., /set token <token>)\n"
+            "/set_token - Alias for setting token\n"
+        )
+        await query.message.reply_text(help_text, parse_mode="Markdown")
+        
+    elif query.data == "upload_now":
+        if chat_id in STATE and "video_path" in STATE[chat_id]:
+            await query.message.edit_text("🚀 Uploading now...")
+            try:
+                link = upload_to_youtube(
+                    STATE[chat_id]["video_path"],
+                    STATE[chat_id]["topic"],
+                    STATE[chat_id]["prompt"],
+                    update.effective_user.id
+                )
+                await query.message.reply_text(f"✅ Uploaded!\n{link}")
+            except Exception as e:
+                await query.message.reply_text(f"❌ Error: {str(e)}")
+            
+            # Cleanup
+            cleanup_chat(chat_id)
+        else:
+            await query.message.reply_text("❌ Session expired or video not found.")
+
+    elif query.data == "schedule":
+        if chat_id in STATE and "video_path" in STATE[chat_id]:
+            STATE[chat_id]["status"] = "scheduling"
+            await query.message.edit_text(
+                "📅 **Scheduling**\n\n"
+                "Please enter the time in **HH:MM** format (24-hour).\n"
+                "Example: `14:30` for 2:30 PM today.\n"
+                "Or `+X` for X minutes from now (e.g., `+10`).",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.message.reply_text("❌ Session expired.")
+
+def cleanup_chat(chat_id):
+    if chat_id in STATE:
+        # Optional: Delete files (images, video) to save space
+        # For now, keeping them as per original logic implies we overwrite or just keep
+        STATE.pop(chat_id)
 
 async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -54,7 +126,6 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.args[0]
         save_user_token(user_id, token)
         await update.message.reply_text("✅ Token saved successfully!")
-        # Try to delete the message containing the token for security
         try:
             await update.message.delete()
         except:
@@ -63,11 +134,8 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Usage: /set_token <your_refresh_token>")
 
 async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Handles /set token <token>
     try:
         if context.args[0].lower() == "token":
-            # Treat as set_token, using the second argument as the token
-            # We mock the context.args for the set_token function or just call save logic directly
             try:
                 token = context.args[1]
                 save_user_token(update.effective_user.id, token)
@@ -83,8 +151,6 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except IndexError:
         await update.message.reply_text("⚠️ Usage: /set token <your_refresh_token>")
 
-
-
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat.id
     text = update.message.text
@@ -93,6 +159,51 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     state = STATE[chat]
+    
+    # Handle Scheduling Input
+    if state.get("status") == "scheduling":
+        try:
+            delay_seconds = 0
+            human_time = ""
+            
+            if text.startswith("+"):
+                # Relative time in minutes
+                mins = int(text.replace("+", ""))
+                delay_seconds = mins * 60
+                run_time = datetime.datetime.now() + datetime.timedelta(minutes=mins)
+                human_time = f"in {mins} minutes"
+            else:
+                # Absolute time HH:MM
+                now = datetime.datetime.now()
+                target_time = datetime.datetime.strptime(text, "%H:%M").time()
+                run_time = datetime.datetime.combine(now.date(), target_time)
+                
+                if run_time < now:
+                    # If time passed today, assume tomorrow
+                    run_time += datetime.timedelta(days=1)
+                
+                delay_seconds = (run_time - now).total_seconds()
+                human_time = f"at {run_time.strftime('%Y-%m-%d %H:%M')}"
+
+            context.job_queue.run_once(
+                scheduled_upload_job,
+                delay_seconds,
+                chat_id=chat,
+                data={
+                    "chat_id": chat,
+                    "video_path": state["video_path"],
+                    "topic": state["topic"],
+                    "prompt": state["prompt"],
+                    "user_id": update.effective_user.id
+                }
+            )
+            
+            await update.message.reply_text(f"✅ Video scheduled to upload {human_time}!")
+            cleanup_chat(chat)
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid format. Use HH:MM or +X (e.g., 14:30 or +10). try again.")
+        return
 
     if "topic" not in state:
         state["topic"] = text
@@ -105,15 +216,36 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE):
+    job_data = context.job.data
+    chat_id = job_data["chat_id"]
+    
+    try:
+        await context.bot.send_message(chat_id, "⏰ Running scheduled upload...")
+        link = upload_to_youtube(
+            job_data["video_path"],
+            job_data["topic"],
+            job_data["prompt"],
+            job_data["user_id"]
+        )
+        await context.bot.send_message(chat_id, f"✅ Scheduled Upload Complete!\n{link}")
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"❌ Scheduled Upload Failed: {str(e)}")
+
+
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat.id
     if chat not in STATE:
         return
 
     state = STATE[chat]
+    # If we are in scheduling mode, ignore photos or reset? 
+    # Let's assume photos only valid during image collection.
+    if state.get("status") == "scheduling":
+        return
 
     file = await update.message.photo[-1].get_file()
-    path = f"backgrounds/bg{len(state['images'])}.jpg"
+    path = f"backgrounds/{chat}_bg{len(state['images'])}.jpg"
     await file.download_to_drive(path)
 
     state["images"].append(path)
@@ -121,27 +253,39 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📸 Image {len(state['images'])} saved")
 
     if len(state["images"]) >= 4:
-        await update.message.reply_text("🎬 Creating video…")
+        await update.message.reply_text("🎬 Creating video, please wait...")
 
         try:
-            link = create_video_and_upload(
+            video_path = create_video(
                 state["topic"],
                 state["prompt"],
                 state["images"],
-                update.effective_user.id
+                chat
             )
-            await update.message.reply_text(f"✅ Uploaded!\n{link}")
+            state["video_path"] = video_path
+            
+            # Show Options
+            keyboard = [
+                [InlineKeyboardButton("🚀 Upload Now", callback_data="upload_now")],
+                [InlineKeyboardButton("📅 Schedule", callback_data="schedule")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "✅ Video created! What would you like to do?",
+                reply_markup=reply_markup
+            )
+            
         except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-        
-        STATE.pop(chat)
+            await update.message.reply_text(f"❌ Error creating video: {str(e)}")
+            STATE.pop(chat)
 
 
-def create_video_and_upload(topic, prompt, images, user_id):
+def create_video(topic, prompt, images, chat_id):
     lang = "hi" if detect(prompt) in ["hi", "mr"] else "en"
 
-    gTTS(prompt, lang=lang).save("voice.mp3")
-    audio = AudioFileClip("voice.mp3")
+    voice_path = f"voice_{chat_id}.mp3"
+    gTTS(prompt, lang=lang).save(voice_path)
+    audio = AudioFileClip(voice_path)
 
     duration = max(audio.duration, 15)
 
@@ -162,18 +306,27 @@ def create_video_and_upload(topic, prompt, images, user_id):
     bg = mp.concatenate_videoclips(clips).subclipped(0, duration)
 
     final = CompositeVideoClip([bg]).with_audio(audio)
+    
+    output_filename = f"videos/output_{chat_id}_{int(datetime.datetime.now().timestamp())}.mp4"
 
     final.write_videofile(
-        "output.mp4",
+        output_filename,
         fps=30,
         codec="libx264",
         audio_codec="aac"
     )
+    
+    # Clean up voice file
+    try:
+        os.remove(voice_path)
+        audio.close() # Close to release file lock
+    except:
+        pass
 
-    return upload_to_youtube(topic, prompt, user_id)
+    return output_filename
 
 
-def upload_to_youtube(topic, desc, user_id):
+def upload_to_youtube(video_path, topic, desc, user_id):
     tokens = load_user_tokens()
     refresh_token = tokens.get(str(user_id))
     
@@ -200,7 +353,7 @@ def upload_to_youtube(topic, desc, user_id):
             },
             "status": {"privacyStatus": "public"}
         },
-        media_body=MediaFileUpload("output.mp4")
+        media_body=MediaFileUpload(video_path)
     )
 
     res = req.execute()
@@ -228,10 +381,12 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("set_token", set_token))
     app.add_handler(CommandHandler("set", set_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
     print("Bot running...")
     app.run_polling()
